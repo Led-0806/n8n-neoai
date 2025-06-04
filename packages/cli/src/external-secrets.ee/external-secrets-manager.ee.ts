@@ -1,14 +1,19 @@
-import { OnShutdown } from '@n8n/decorators';
+import { Logger } from '@n8n/backend-common';
+import { SettingsRepository } from '@n8n/db';
+import { OnPubSubEvent, OnShutdown } from '@n8n/decorators';
 import { Service } from '@n8n/di';
-import { Cipher, Logger } from 'n8n-core';
+import { Cipher } from 'n8n-core';
 import { jsonParse, type IDataObject, ensureError, UnexpectedError } from 'n8n-workflow';
 
-import { SettingsRepository } from '@/databases/repositories/settings.repository';
 import { EventService } from '@/events/event.service';
 import { License } from '@/license';
 import { Publisher } from '@/scaling/pubsub/publisher.service';
 
-import { EXTERNAL_SECRETS_INITIAL_BACKOFF, EXTERNAL_SECRETS_MAX_BACKOFF } from './constants';
+import {
+	EXTERNAL_SECRETS_DB_KEY,
+	EXTERNAL_SECRETS_INITIAL_BACKOFF,
+	EXTERNAL_SECRETS_MAX_BACKOFF,
+} from './constants';
 import { ExternalSecretsProviders } from './external-secrets-providers.ee';
 import { ExternalSecretsConfig } from './external-secrets.config';
 import type { ExternalSecretsSettings, SecretsProvider, SecretsProviderSettings } from './types';
@@ -23,9 +28,9 @@ export class ExternalSecretsManager {
 
 	initialized = false;
 
-	updateInterval: NodeJS.Timer;
+	updateInterval: NodeJS.Timeout;
 
-	initRetryTimeouts: Record<string, NodeJS.Timer> = {};
+	initRetryTimeouts: Record<string, NodeJS.Timeout> = {};
 
 	constructor(
 		private readonly logger: Logger,
@@ -72,6 +77,7 @@ export class ExternalSecretsManager {
 		this.logger.debug('External secrets manager shut down');
 	}
 
+	@OnPubSubEvent('reload-external-secrets-providers')
 	async reloadAllProviders(backoff?: number) {
 		this.logger.debug('Reloading all external secrets providers');
 		const providers = this.getProviderNames();
@@ -89,8 +95,9 @@ export class ExternalSecretsManager {
 		void this.publisher.publishCommand({ command: 'reload-external-secrets-providers' });
 	}
 
-	private async getDecryptedSettings(): Promise<ExternalSecretsSettings | null> {
-		const encryptedSettings = await this.settingsRepo.getEncryptedSecretsProviderSettings();
+	async getDecryptedSettings(): Promise<ExternalSecretsSettings | null> {
+		const encryptedSettings =
+			(await this.settingsRepo.findByKey(EXTERNAL_SECRETS_DB_KEY))?.value ?? null;
 		if (encryptedSettings === null) {
 			return null;
 		}
@@ -324,7 +331,14 @@ export class ExternalSecretsManager {
 
 	async saveAndSetSettings(settings: ExternalSecretsSettings) {
 		const encryptedSettings = this.encryptSecretsSettings(settings);
-		await this.settingsRepo.saveEncryptedSecretsProviderSettings(encryptedSettings);
+		await this.settingsRepo.upsert(
+			{
+				key: EXTERNAL_SECRETS_DB_KEY,
+				value: encryptedSettings,
+				loadOnStartup: false,
+			},
+			['key'],
+		);
 	}
 
 	async testProviderSettings(
